@@ -110,105 +110,207 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
 
     #[cfg(target_os = "windows")]
     {
-        let pdf_path_str = pdf_path.display().to_string().replace("\\", "/");
+        let pdf_path_str = pdf_path.display().to_string();
 
-        // Use Windows 10+ built-in PDF rendering via PowerShell
-        // This renders PDF to image and prints using System.Drawing.Printing
+        // Create log file path for debugging
+        let log_path = temp_dir.path().join("print_debug.log");
+        let log_path_str = log_path.display().to_string();
+
+        // Comprehensive Windows print script with detailed logging
         let script = format!(
             r#"
-Add-Type -AssemblyName System.Drawing
+$ErrorActionPreference = "Stop"
+$logFile = '{log_path}'
 
-# Load Windows Runtime for PDF rendering
-Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$null = [Windows.Foundation.IAsyncOperation`1, Windows.Foundation, ContentType=WindowsRuntime]
-$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage, ContentType=WindowsRuntime]
-$null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType=WindowsRuntime]
-
-function Await($WinRtTask, $ResultType) {{
-    $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
-        $_.Name -eq 'AsTask' -and
-        $_.GetParameters().Count -eq 1 -and
-        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-    }} | Select-Object -First 1
-    $asTaskT = $asTask.MakeGenericMethod($ResultType)
-    $task = $asTaskT.Invoke($null, @($WinRtTask))
-    $task.Wait()
-    return $task.Result
+function Log($msg) {{
+    $timestamp = Get-Date -Format "HH:mm:ss.fff"
+    "$timestamp - $msg" | Add-Content -Path $logFile -Encoding UTF8
+    Write-Host $msg
 }}
 
 try {{
-    $pdfPath = '{}'
-    $printerName = '{}'
+    $pdfPath = '{pdf_path}'
+    $printerName = '{printer_name}'
 
-    # Open PDF file
-    $file = [System.IO.File]::OpenRead($pdfPath)
-    $randomAccessStream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($file)
+    Log "=== GLS Print Agent Debug Log ==="
+    Log "PDF Path: $pdfPath"
+    Log "Printer: $printerName"
+    Log "Windows Version: $([System.Environment]::OSVersion.Version)"
 
-    # Load PDF document
-    $pdfDoc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromStreamAsync($randomAccessStream)) ([Windows.Data.Pdf.PdfDocument])
+    # Check if PDF exists
+    if (-not (Test-Path $pdfPath)) {{
+        throw "PDF fil ikke fundet: $pdfPath"
+    }}
+    Log "PDF fil fundet: $((Get-Item $pdfPath).Length) bytes"
 
-    # Render first page to image
-    $page = $pdfDoc.GetPage(0)
-    $memStream = New-Object System.IO.MemoryStream
-    $outputStream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($memStream)
-
-    # Render at 300 DPI for good print quality
-    $renderOptions = New-Object Windows.Data.Pdf.PdfPageRenderOptions
-    $renderOptions.DestinationWidth = [uint32]($page.Size.Width * 4)
-    $renderOptions.DestinationHeight = [uint32]($page.Size.Height * 4)
-
-    $null = Await ($page.RenderToStreamAsync($outputStream, $renderOptions)) ([Object])
-
-    $memStream.Position = 0
-    $bitmap = [System.Drawing.Image]::FromStream($memStream)
-
-    # Print the image
-    $printDoc = New-Object System.Drawing.Printing.PrintDocument
-    $printDoc.PrinterSettings.PrinterName = $printerName
-
-    if (-not $printDoc.PrinterSettings.IsValid) {{
+    # Check printer exists
+    $printer = Get-Printer -Name $printerName -ErrorAction SilentlyContinue
+    if (-not $printer) {{
+        Log "Tilgaengelige printere:"
+        Get-Printer | ForEach-Object {{ Log "  - $($_.Name)" }}
         throw "Printer ikke fundet: $printerName"
     }}
+    Log "Printer fundet: $($printer.Name), Driver: $($printer.DriverName), Port: $($printer.PortName)"
 
+    # Method 1: Try using .NET System.Drawing.Printing with PDF rendered via WinRT
+    Log "Forsøger Windows.Data.Pdf rendering..."
+
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+    # Load WinRT types
+    $null = [Windows.Storage.StorageFile, Windows.Storage, ContentType=WindowsRuntime]
+    $null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType=WindowsRuntime]
+
+    # Helper for async
+    Add-Type -TypeDefinition @"
+using System;
+using System.Threading.Tasks;
+using Windows.Data.Pdf;
+using Windows.Storage;
+using Windows.Storage.Streams;
+
+public static class PdfHelper {{
+    public static PdfDocument LoadPdf(string path) {{
+        var file = StorageFile.GetFileFromPathAsync(path).AsTask().Result;
+        return PdfDocument.LoadFromFileAsync(file).AsTask().Result;
+    }}
+
+    public static byte[] RenderPage(PdfPage page, uint width, uint height) {{
+        using (var stream = new InMemoryRandomAccessStream()) {{
+            var options = new PdfPageRenderOptions();
+            options.DestinationWidth = width;
+            options.DestinationHeight = height;
+            page.RenderToStreamAsync(stream, options).AsTask().Wait();
+
+            stream.Seek(0);
+            var bytes = new byte[stream.Size];
+            var reader = new DataReader(stream);
+            reader.LoadAsync((uint)stream.Size).AsTask().Wait();
+            reader.ReadBytes(bytes);
+            return bytes;
+        }}
+    }}
+}}
+"@ -ReferencedAssemblies @(
+    "System.Runtime.WindowsRuntime",
+    "$([System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory())System.Runtime.dll",
+    "$env:SystemRoot\System32\WinMetadata\Windows.Foundation.winmd",
+    "$env:SystemRoot\System32\WinMetadata\Windows.Storage.winmd",
+    "$env:SystemRoot\System32\WinMetadata\Windows.Data.winmd"
+) -ErrorAction Stop
+
+    Log "WinRT types loaded successfully"
+
+    # Load and render PDF
+    $pdfDoc = [PdfHelper]::LoadPdf($pdfPath)
+    Log "PDF loaded: $($pdfDoc.PageCount) pages"
+
+    $page = $pdfDoc.GetPage(0)
+    $pageWidth = [uint32]($page.Size.Width * 3)
+    $pageHeight = [uint32]($page.Size.Height * 3)
+    Log "Page size: $($page.Size.Width) x $($page.Size.Height), rendering at: $pageWidth x $pageHeight"
+
+    $imageBytes = [PdfHelper]::RenderPage($page, $pageWidth, $pageHeight)
+    Log "Rendered to $($imageBytes.Length) bytes"
+
+    # Convert to bitmap
+    $memStream = New-Object System.IO.MemoryStream(,$imageBytes)
+    $bitmap = [System.Drawing.Image]::FromStream($memStream)
+    Log "Bitmap created: $($bitmap.Width) x $($bitmap.Height)"
+
+    # Print
+    $printDoc = New-Object System.Drawing.Printing.PrintDocument
+    $printDoc.PrinterSettings.PrinterName = $printerName
+    $printDoc.DocumentName = "GLS Label"
+
+    # Use StandardPrintController for silent printing (no dialog)
+    $printDoc.PrintController = New-Object System.Drawing.Printing.StandardPrintController
+
+    Log "Printer valid: $($printDoc.PrinterSettings.IsValid)"
+    Log "Paper size: $($printDoc.DefaultPageSettings.PaperSize.PaperName)"
+
+    $script:printBitmap = $bitmap
     $printDoc.add_PrintPage({{
         param($sender, $e)
-        $destRect = $e.MarginBounds
-        $e.Graphics.DrawImage($bitmap, $destRect)
+
+        # Scale image to fit the printable area while maintaining aspect ratio
+        $imgRatio = $script:printBitmap.Width / $script:printBitmap.Height
+        $pageRatio = $e.MarginBounds.Width / $e.MarginBounds.Height
+
+        $destWidth = $e.MarginBounds.Width
+        $destHeight = $e.MarginBounds.Height
+
+        if ($imgRatio -gt $pageRatio) {{
+            $destHeight = $destWidth / $imgRatio
+        }} else {{
+            $destWidth = $destHeight * $imgRatio
+        }}
+
+        $destRect = New-Object System.Drawing.RectangleF(
+            $e.MarginBounds.X,
+            $e.MarginBounds.Y,
+            $destWidth,
+            $destHeight
+        )
+
+        $e.Graphics.DrawImage($script:printBitmap, $destRect)
     }})
 
+    Log "Starting print..."
     $printDoc.Print()
+    Log "Print command sent successfully"
 
     $bitmap.Dispose()
     $memStream.Dispose()
-    $file.Close()
+    $page.Dispose()
+    $pdfDoc.Dispose()
 
+    Log "=== PRINT SUCCESSFUL ==="
     Write-Output "SUCCESS"
+
 }} catch {{
-    Write-Error $_.Exception.Message
+    $errorMsg = $_.Exception.Message
+    if ($_.Exception.InnerException) {{
+        $errorMsg += " Inner: " + $_.Exception.InnerException.Message
+    }}
+    Log "ERROR: $errorMsg"
+    Log "Stack: $($_.ScriptStackTrace)"
+    Write-Error $errorMsg
 }}
 "#,
-            pdf_path_str.replace("'", "''"),
-            printer_name.replace("'", "''")
+            log_path = log_path_str.replace("\\", "\\\\").replace("'", "''"),
+            pdf_path = pdf_path_str.replace("\\", "\\\\").replace("'", "''"),
+            printer_name = printer_name.replace("'", "''")
         );
 
         let output = Command::new("powershell")
-            .args(["-ExecutionPolicy", "Bypass", "-Command", &script])
+            .args(["-ExecutionPolicy", "Bypass", "-NoProfile", "-Command", &script])
             .output()
-            .map_err(|e| format!("PowerShell failed: {}", e))?;
+            .map_err(|e| format!("PowerShell failed to start: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
-        if stdout.trim() == "SUCCESS" {
+        // Read the debug log if it exists
+        let debug_log = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+        if stdout.trim().contains("SUCCESS") {
             return Ok(PrintResult {
                 success: true,
                 size_kb,
                 message: format!("Printed to {}", printer_name),
             });
-        } else if !stderr.is_empty() {
-            return Err(format!("Print fejl: {}", stderr.trim()));
         } else {
-            return Err(format!("Print fejl: Ukendt fejl. stdout={}, stderr={}", stdout.trim(), stderr.trim()));
+            // Return detailed error with log contents
+            let error_detail = if !stderr.is_empty() {
+                format!("{}\n\nLog:\n{}", stderr.trim(), debug_log)
+            } else if !debug_log.is_empty() {
+                format!("Print failed.\n\nLog:\n{}", debug_log)
+            } else {
+                format!("Unknown error. stdout={}, stderr={}", stdout.trim(), stderr.trim())
+            };
+            return Err(error_detail);
         }
     }
 
