@@ -110,85 +110,101 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
 
     #[cfg(target_os = "windows")]
     {
-        // Use PDFtoPrinter or print via PowerShell with Out-Printer
-        // Method 1: Try using PowerShell Get-Content and Out-Printer (works for raw/text)
-        // Method 2: Use rundll32 with mshtml (more reliable for PDFs)
-
         let pdf_path_str = pdf_path.display().to_string();
 
-        // Use PowerShell to print PDF via default PDF handler
-        // The -PassThru and -Wait ensure we wait for completion
-        let script = format!(
-            r#"
-            $pdfPath = '{}'
-            $printerName = '{}'
+        // Method 1: Try SumatraPDF (best for silent printing)
+        // Check common installation paths
+        let sumatra_paths = [
+            r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
+            r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
+            &format!(r"{}\AppData\Local\SumatraPDF\SumatraPDF.exe", std::env::var("USERPROFILE").unwrap_or_default()),
+        ];
 
-            # Method: Use Windows print verb with shell
-            $shell = New-Object -ComObject Shell.Application
-            $folder = $shell.Namespace((Split-Path $pdfPath))
-            $file = $folder.ParseName((Split-Path $pdfPath -Leaf))
+        for sumatra_path in &sumatra_paths {
+            if std::path::Path::new(sumatra_path).exists() {
+                let output = Command::new(sumatra_path)
+                    .args([
+                        "-print-to", &printer_name,
+                        "-silent",
+                        "-print-settings", "fit",
+                        &pdf_path_str,
+                    ])
+                    .output()
+                    .map_err(|e| format!("SumatraPDF failed: {}", e))?;
 
-            # Get the PrintTo verb
-            $printVerb = $file.Verbs() | Where-Object {{ $_.Name -like '*Print*' }} | Select-Object -First 1
-
-            if ($printVerb) {{
-                # Set default printer temporarily
-                $oldDefault = (Get-WmiObject -Query "SELECT * FROM Win32_Printer WHERE Default=$true").Name
-                $printer = Get-WmiObject -Query "SELECT * FROM Win32_Printer WHERE Name='$printerName'"
-                if ($printer) {{
-                    $printer.SetDefaultPrinter() | Out-Null
-                    $printVerb.DoIt()
-                    Start-Sleep -Seconds 2
-                    # Restore old default if different
-                    if ($oldDefault -and $oldDefault -ne $printerName) {{
-                        $oldPrinter = Get-WmiObject -Query "SELECT * FROM Win32_Printer WHERE Name='$oldDefault'"
-                        if ($oldPrinter) {{ $oldPrinter.SetDefaultPrinter() | Out-Null }}
-                    }}
-                    Write-Output "SUCCESS"
-                }} else {{
-                    Write-Error "Printer not found: $printerName"
-                }}
-            }} else {{
-                Write-Error "No print verb available"
-            }}
-            "#,
-            pdf_path_str.replace("'", "''"),
-            printer_name.replace("'", "''")
-        );
-
-        let output = Command::new("powershell")
-            .args(["-ExecutionPolicy", "Bypass", "-Command", &script])
-            .output()
-            .map_err(|e| format!("Failed to execute print command: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if stdout.contains("SUCCESS") {
-            return Ok(PrintResult {
-                success: true,
-                size_kb,
-                message: format!("Printed to {}", printer_name),
-            });
-        } else if !stderr.is_empty() {
-            return Err(format!("Print failed: {}", stderr.trim()));
-        } else {
-            // Fallback: try direct print command
-            let fallback_output = Command::new("cmd")
-                .args(["/C", "print", &format!("/D:{}", printer_name), &pdf_path_str])
-                .output()
-                .map_err(|e| format!("Fallback print failed: {}", e))?;
-
-            if fallback_output.status.success() {
-                return Ok(PrintResult {
-                    success: true,
-                    size_kb,
-                    message: format!("Printed via cmd to {}", printer_name),
-                });
+                if output.status.success() {
+                    return Ok(PrintResult {
+                        success: true,
+                        size_kb,
+                        message: format!("Printed via SumatraPDF to {}", printer_name),
+                    });
+                }
             }
-
-            return Err("Print command completed but status unclear".to_string());
         }
+
+        // Method 2: Try Adobe Reader if installed
+        let adobe_paths = [
+            r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+            r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
+            r"C:\Program Files\Adobe\Reader 11.0\Reader\AcroRd32.exe",
+            r"C:\Program Files (x86)\Adobe\Reader 11.0\Reader\AcroRd32.exe",
+        ];
+
+        for adobe_path in &adobe_paths {
+            if std::path::Path::new(adobe_path).exists() {
+                let output = Command::new(adobe_path)
+                    .args([
+                        "/t",  // Print and exit
+                        &pdf_path_str,
+                        &printer_name,
+                    ])
+                    .output()
+                    .map_err(|e| format!("Adobe Reader failed: {}", e))?;
+
+                // Adobe Reader returns quickly, give it time to spool
+                std::thread::sleep(std::time::Duration::from_secs(3));
+
+                if output.status.success() {
+                    return Ok(PrintResult {
+                        success: true,
+                        size_kb,
+                        message: format!("Printed via Adobe Reader to {}", printer_name),
+                    });
+                }
+            }
+        }
+
+        // Method 3: Try Foxit Reader
+        let foxit_paths = [
+            r"C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
+            r"C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
+        ];
+
+        for foxit_path in &foxit_paths {
+            if std::path::Path::new(foxit_path).exists() {
+                let output = Command::new(foxit_path)
+                    .args([
+                        "/t",
+                        &pdf_path_str,
+                        &printer_name,
+                    ])
+                    .output()
+                    .map_err(|e| format!("Foxit Reader failed: {}", e))?;
+
+                std::thread::sleep(std::time::Duration::from_secs(3));
+
+                if output.status.success() {
+                    return Ok(PrintResult {
+                        success: true,
+                        size_kb,
+                        message: format!("Printed via Foxit Reader to {}", printer_name),
+                    });
+                }
+            }
+        }
+
+        // No PDF reader found
+        return Err("Ingen PDF-læser fundet. Installer SumatraPDF fra https://www.sumatrapdfreader.org/download-free-pdf-viewer".to_string());
     }
 
     #[cfg(target_os = "linux")]
