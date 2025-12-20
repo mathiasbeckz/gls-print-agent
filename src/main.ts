@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { Store } from "@tauri-apps/plugin-store";
 
 // Types
@@ -45,9 +46,17 @@ const startStopBtn = document.getElementById("start-stop")!;
 const activityLog = document.getElementById("activity-log")!;
 const jobsTodayEl = document.getElementById("jobs-today")!;
 const jobsTotalEl = document.getElementById("jobs-total")!;
+const appVersionEl = document.getElementById("app-version")!;
 
 // Initialize
 async function init() {
+  // Show app version
+  try {
+    const version = await getVersion();
+    appVersionEl.textContent = `v${version}`;
+  } catch {
+    appVersionEl.textContent = "v?";
+  }
   // Initialize store
   store = await Store.load("config.json");
 
