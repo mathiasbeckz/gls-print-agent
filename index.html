@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="da">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GLS Print Agent</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>GLS Print Agent</h1>
+        <div id="status" class="status offline">Ikke forbundet</div>
+      </header>
+
+      <main>
+        <section id="config-section" class="section">
+          <h2>Konfiguration</h2>
+          <div class="form-group">
+            <label for="api-url">Server URL</label>
+            <input type="text" id="api-url" placeholder="https://shipping-app-tau.vercel.app" />
+          </div>
+          <div class="form-group">
+            <label for="api-key">API Nøgle</label>
+            <input type="password" id="api-key" placeholder="gls_xxxxxxxx..." />
+          </div>
+          <div class="form-group">
+            <label for="printer-select">Printer</label>
+            <select id="printer-select">
+              <option value="">Vælg printer...</option>
+            </select>
+          </div>
+          <div class="form-group checkbox-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="test-mode" />
+              <span>Test-tilstand (printer ikke)</span>
+            </label>
+          </div>
+          <button id="save-config" class="btn primary">Gem konfiguration</button>
+        </section>
+
+        <section id="activity-section" class="section">
+          <h2>Aktivitet</h2>
+          <div id="activity-log" class="activity-log">
+            <p class="log-item info">Print Agent startet...</p>
+          </div>
+        </section>
+
+        <section id="stats-section" class="section">
+          <h2>Statistik</h2>
+          <div class="stats">
+            <div class="stat">
+              <span class="stat-value" id="jobs-today">0</span>
+              <span class="stat-label">I dag</span>
+            </div>
+            <div class="stat">
+              <span class="stat-value" id="jobs-total">0</span>
+              <span class="stat-label">Total</span>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <button id="start-stop" class="btn secondary">Start</button>
+        <span class="version">v0.1.0</span>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
