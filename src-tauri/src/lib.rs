@@ -110,101 +110,106 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
 
     #[cfg(target_os = "windows")]
     {
-        let pdf_path_str = pdf_path.display().to_string();
+        let pdf_path_str = pdf_path.display().to_string().replace("\\", "/");
 
-        // Method 1: Try SumatraPDF (best for silent printing)
-        // Check common installation paths
-        let sumatra_paths = [
-            r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
-            r"C:\Program Files (x86)\SumatraPDF\SumatraPDF.exe",
-            &format!(r"{}\AppData\Local\SumatraPDF\SumatraPDF.exe", std::env::var("USERPROFILE").unwrap_or_default()),
-        ];
+        // Use Windows 10+ built-in PDF rendering via PowerShell
+        // This renders PDF to image and prints using System.Drawing.Printing
+        let script = format!(
+            r#"
+Add-Type -AssemblyName System.Drawing
 
-        for sumatra_path in &sumatra_paths {
-            if std::path::Path::new(sumatra_path).exists() {
-                let output = Command::new(sumatra_path)
-                    .args([
-                        "-print-to", &printer_name,
-                        "-silent",
-                        "-print-settings", "fit",
-                        &pdf_path_str,
-                    ])
-                    .output()
-                    .map_err(|e| format!("SumatraPDF failed: {}", e))?;
+# Load Windows Runtime for PDF rendering
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Foundation.IAsyncOperation`1, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Storage, ContentType=WindowsRuntime]
+$null = [Windows.Data.Pdf.PdfDocument, Windows.Data.Pdf, ContentType=WindowsRuntime]
 
-                if output.status.success() {
-                    return Ok(PrintResult {
-                        success: true,
-                        size_kb,
-                        message: format!("Printed via SumatraPDF to {}", printer_name),
-                    });
-                }
-            }
+function Await($WinRtTask, $ResultType) {{
+    $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+        $_.Name -eq 'AsTask' -and
+        $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    }} | Select-Object -First 1
+    $asTaskT = $asTask.MakeGenericMethod($ResultType)
+    $task = $asTaskT.Invoke($null, @($WinRtTask))
+    $task.Wait()
+    return $task.Result
+}}
+
+try {{
+    $pdfPath = '{}'
+    $printerName = '{}'
+
+    # Open PDF file
+    $file = [System.IO.File]::OpenRead($pdfPath)
+    $randomAccessStream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($file)
+
+    # Load PDF document
+    $pdfDoc = Await ([Windows.Data.Pdf.PdfDocument]::LoadFromStreamAsync($randomAccessStream)) ([Windows.Data.Pdf.PdfDocument])
+
+    # Render first page to image
+    $page = $pdfDoc.GetPage(0)
+    $memStream = New-Object System.IO.MemoryStream
+    $outputStream = [System.IO.WindowsRuntimeStreamExtensions]::AsRandomAccessStream($memStream)
+
+    # Render at 300 DPI for good print quality
+    $renderOptions = New-Object Windows.Data.Pdf.PdfPageRenderOptions
+    $renderOptions.DestinationWidth = [uint32]($page.Size.Width * 4)
+    $renderOptions.DestinationHeight = [uint32]($page.Size.Height * 4)
+
+    $null = Await ($page.RenderToStreamAsync($outputStream, $renderOptions)) ([Object])
+
+    $memStream.Position = 0
+    $bitmap = [System.Drawing.Image]::FromStream($memStream)
+
+    # Print the image
+    $printDoc = New-Object System.Drawing.Printing.PrintDocument
+    $printDoc.PrinterSettings.PrinterName = $printerName
+
+    if (-not $printDoc.PrinterSettings.IsValid) {{
+        throw "Printer ikke fundet: $printerName"
+    }}
+
+    $printDoc.add_PrintPage({{
+        param($sender, $e)
+        $destRect = $e.MarginBounds
+        $e.Graphics.DrawImage($bitmap, $destRect)
+    }})
+
+    $printDoc.Print()
+
+    $bitmap.Dispose()
+    $memStream.Dispose()
+    $file.Close()
+
+    Write-Output "SUCCESS"
+}} catch {{
+    Write-Error $_.Exception.Message
+}}
+"#,
+            pdf_path_str.replace("'", "''"),
+            printer_name.replace("'", "''")
+        );
+
+        let output = Command::new("powershell")
+            .args(["-ExecutionPolicy", "Bypass", "-Command", &script])
+            .output()
+            .map_err(|e| format!("PowerShell failed: {}", e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if stdout.trim() == "SUCCESS" {
+            return Ok(PrintResult {
+                success: true,
+                size_kb,
+                message: format!("Printed to {}", printer_name),
+            });
+        } else if !stderr.is_empty() {
+            return Err(format!("Print fejl: {}", stderr.trim()));
+        } else {
+            return Err(format!("Print fejl: Ukendt fejl. stdout={}, stderr={}", stdout.trim(), stderr.trim()));
         }
-
-        // Method 2: Try Adobe Reader if installed
-        let adobe_paths = [
-            r"C:\Program Files\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-            r"C:\Program Files (x86)\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe",
-            r"C:\Program Files\Adobe\Reader 11.0\Reader\AcroRd32.exe",
-            r"C:\Program Files (x86)\Adobe\Reader 11.0\Reader\AcroRd32.exe",
-        ];
-
-        for adobe_path in &adobe_paths {
-            if std::path::Path::new(adobe_path).exists() {
-                let output = Command::new(adobe_path)
-                    .args([
-                        "/t",  // Print and exit
-                        &pdf_path_str,
-                        &printer_name,
-                    ])
-                    .output()
-                    .map_err(|e| format!("Adobe Reader failed: {}", e))?;
-
-                // Adobe Reader returns quickly, give it time to spool
-                std::thread::sleep(std::time::Duration::from_secs(3));
-
-                if output.status.success() {
-                    return Ok(PrintResult {
-                        success: true,
-                        size_kb,
-                        message: format!("Printed via Adobe Reader to {}", printer_name),
-                    });
-                }
-            }
-        }
-
-        // Method 3: Try Foxit Reader
-        let foxit_paths = [
-            r"C:\Program Files\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-            r"C:\Program Files (x86)\Foxit Software\Foxit PDF Reader\FoxitPDFReader.exe",
-        ];
-
-        for foxit_path in &foxit_paths {
-            if std::path::Path::new(foxit_path).exists() {
-                let output = Command::new(foxit_path)
-                    .args([
-                        "/t",
-                        &pdf_path_str,
-                        &printer_name,
-                    ])
-                    .output()
-                    .map_err(|e| format!("Foxit Reader failed: {}", e))?;
-
-                std::thread::sleep(std::time::Duration::from_secs(3));
-
-                if output.status.success() {
-                    return Ok(PrintResult {
-                        success: true,
-                        size_kb,
-                        message: format!("Printed via Foxit Reader to {}", printer_name),
-                    });
-                }
-            }
-        }
-
-        // No PDF reader found
-        return Err("Ingen PDF-læser fundet. Installer SumatraPDF fra https://www.sumatrapdfreader.org/download-free-pdf-viewer".to_string());
     }
 
     #[cfg(target_os = "linux")]
