@@ -209,8 +209,13 @@ async function processJob(job: PrintJob) {
         log(`${modeLabel} Ville printe: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${pdfSizeKb} KB`, "success");
       } else {
         // Real mode: actually print
-        await printPdf(label.labelPdf, label.shopifyOrderName);
-        log(`Printet: ${label.shopifyOrderName} (${label.glsTrackingNumber})`, "success");
+        try {
+          const result = await printPdf(label.labelPdf, label.shopifyOrderName);
+          log(`Printet: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${result.size_kb} KB`, "success");
+        } catch (printError) {
+          log(`Print fejl for ${label.shopifyOrderName}: ${printError}`, "error");
+          throw printError;
+        }
       }
     }
 
@@ -230,8 +235,14 @@ async function processJob(job: PrintJob) {
   }
 }
 
-async function printPdf(base64Pdf: string, orderName: string) {
-  await invoke("print_pdf", {
+interface PrintResult {
+  success: boolean;
+  size_kb: number;
+  message: string;
+}
+
+async function printPdf(base64Pdf: string, orderName: string): Promise<PrintResult> {
+  return await invoke("print_pdf", {
     pdfBase64: base64Pdf,
     printerName: config.selectedPrinter,
     jobName: `GLS Label - ${orderName}`,
