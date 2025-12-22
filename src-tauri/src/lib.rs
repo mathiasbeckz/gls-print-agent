@@ -1,11 +1,6 @@
 use std::process::Command;
 use base64::Engine;
 
-#[cfg(target_os = "windows")]
-use pdfium_render::prelude::*;
-#[cfg(target_os = "windows")]
-use image::GenericImageView;
-
 // Get list of available printers
 #[tauri::command]
 fn get_printers() -> Result<Vec<String>, String> {
@@ -28,14 +23,16 @@ fn get_printers() -> Result<Vec<String>, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("powershell")
-            .args(["-Command", "Get-Printer | Select-Object -ExpandProperty Name"])
+        // Use wmic which is more reliable than PowerShell on some systems
+        let output = Command::new("wmic")
+            .args(["printer", "get", "name"])
             .output()
             .map_err(|e| e.to_string())?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let printers: Vec<String> = stdout
             .lines()
+            .skip(1) // Skip header "Name"
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
@@ -86,7 +83,7 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
     std::fs::write(&pdf_path, &pdf_bytes)
         .map_err(|e| format!("Failed to write PDF: {}", e))?;
 
-    // Print using system command (macOS and Linux use lp, Windows uses native API)
+    // Print using system command
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("lp")
@@ -112,8 +109,7 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
 
     #[cfg(target_os = "windows")]
     {
-        // Use native Windows printing with pdfium
-        print_pdf_windows(&pdf_bytes, &printer_name, &job_name, size_kb)
+        print_pdf_windows(&pdf_path, &printer_name, size_kb)
     }
 
     #[cfg(target_os = "linux")]
@@ -140,172 +136,50 @@ fn print_pdf(pdf_base64: String, printer_name: String, job_name: String) -> Resu
     }
 }
 
+// Print PDF using SumatraPDF on Windows (silent, reliable)
 #[cfg(target_os = "windows")]
-fn print_pdf_windows(pdf_bytes: &[u8], printer_name: &str, job_name: &str, size_kb: usize) -> Result<PrintResult, String> {
-    use windows::core::{PCSTR, PCWSTR};
-    use windows::Win32::Foundation::*;
-    use windows::Win32::Graphics::Gdi::*;
-    use windows::Win32::Graphics::Printing::*;
+fn print_pdf_windows(pdf_path: &std::path::Path, printer_name: &str, size_kb: usize) -> Result<PrintResult, String> {
+    // Find SumatraPDF.exe - it's bundled next to the executable
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_dir = exe_path.parent()
+        .ok_or_else(|| "Failed to get executable directory".to_string())?;
 
-    // Try to load pdfium - first from app directory, then system
-    let pdfium = Pdfium::new(
-        Pdfium::bind_to_library(
-            Pdfium::pdfium_platform_library_name_at_path("./")
-        )
-        .or_else(|_| Pdfium::bind_to_system_library())
-        .map_err(|e| format!("Failed to load pdfium: {}. Please ensure pdfium.dll is in the app directory.", e))?
-    );
+    let sumatra_path = exe_dir.join("SumatraPDF.exe");
 
-    // Load PDF from bytes
-    let document = pdfium.load_pdf_from_byte_slice(pdf_bytes, None)
-        .map_err(|e| format!("Failed to load PDF: {}", e))?;
-
-    let page_count = document.pages().len();
-    if page_count == 0 {
-        return Err("PDF has no pages".to_string());
+    if !sumatra_path.exists() {
+        return Err(format!(
+            "SumatraPDF.exe not found at {:?}. Please ensure it's bundled with the application.",
+            sumatra_path
+        ));
     }
 
-    // Render first page to image (for label printing, usually only 1 page)
-    let page = document.pages().get(0)
-        .map_err(|e| format!("Failed to get page: {}", e))?;
+    // Use SumatraPDF for silent printing
+    // Command: SumatraPDF.exe -print-to "printer" -silent file.pdf
+    let output = Command::new(&sumatra_path)
+        .arg("-print-to")
+        .arg(printer_name)
+        .arg("-silent")
+        .arg(pdf_path)
+        .output()
+        .map_err(|e| format!("Failed to execute SumatraPDF: {}", e))?;
 
-    // Render at 300 DPI for good print quality
-    // Label printers typically expect ~203 DPI, but higher is fine
-    let render_config = PdfRenderConfig::new()
-        .set_target_width(1200)  // ~4 inches at 300 DPI
-        .set_maximum_height(1800); // ~6 inches at 300 DPI
-
-    let bitmap = page.render_with_config(&render_config)
-        .map_err(|e| format!("Failed to render PDF: {}", e))?;
-
-    let image = bitmap.as_image();
-    let rgb_image = image.to_rgb8();
-    let width = rgb_image.width();
-    let height = rgb_image.height();
-
-    // Convert printer name to wide string
-    let printer_wide: Vec<u16> = printer_name.encode_utf16().chain(std::iter::once(0)).collect();
-    let job_wide: Vec<u16> = job_name.encode_utf16().chain(std::iter::once(0)).collect();
-
-    unsafe {
-        // Create printer DC
-        let hdc = CreateDCW(
-            PCWSTR::null(),
-            PCWSTR(printer_wide.as_ptr()),
-            PCWSTR::null(),
-            None
-        );
-
-        if hdc.is_invalid() {
-            return Err(format!("Failed to create printer DC for '{}'", printer_name));
-        }
-
-        // Start document
-        let doc_info = DOCINFOW {
-            cbSize: std::mem::size_of::<DOCINFOW>() as i32,
-            lpszDocName: PCWSTR(job_wide.as_ptr()),
-            lpszOutput: PCWSTR::null(),
-            lpszDatatype: PCWSTR::null(),
-            fwType: 0,
-        };
-
-        let doc_result = StartDocW(hdc, &doc_info);
-        if doc_result <= 0 {
-            DeleteDC(hdc);
-            return Err("Failed to start print document".to_string());
-        }
-
-        // Start page
-        if StartPage(hdc) <= 0 {
-            EndDoc(hdc);
-            DeleteDC(hdc);
-            return Err("Failed to start print page".to_string());
-        }
-
-        // Get printer page size
-        let page_width = GetDeviceCaps(hdc, HORZRES);
-        let page_height = GetDeviceCaps(hdc, VERTRES);
-
-        // Calculate scaling to fit page while maintaining aspect ratio
-        let img_ratio = width as f64 / height as f64;
-        let page_ratio = page_width as f64 / page_height as f64;
-
-        let (dest_width, dest_height) = if img_ratio > page_ratio {
-            // Image is wider - fit to width
-            (page_width, (page_width as f64 / img_ratio) as i32)
-        } else {
-            // Image is taller - fit to height
-            ((page_height as f64 * img_ratio) as i32, page_height)
-        };
-
-        // Create bitmap info header
-        let mut bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32), // Negative for top-down
-                biPlanes: 1,
-                biBitCount: 24,
-                biCompression: BI_RGB.0,
-                biSizeImage: 0,
-                biXPelsPerMeter: 0,
-                biYPelsPerMeter: 0,
-                biClrUsed: 0,
-                biClrImportant: 0,
-            },
-            bmiColors: [RGBQUAD::default()],
-        };
-
-        // Convert RGB to BGR (Windows bitmap format)
-        let mut bgr_data: Vec<u8> = Vec::with_capacity((width * height * 3) as usize);
-        for pixel in rgb_image.pixels() {
-            bgr_data.push(pixel[2]); // B
-            bgr_data.push(pixel[1]); // G
-            bgr_data.push(pixel[0]); // R
-        }
-
-        // Pad rows to 4-byte boundary
-        let row_size = ((width * 3 + 3) / 4) * 4;
-        let mut padded_data: Vec<u8> = Vec::with_capacity((row_size * height) as usize);
-        for y in 0..height {
-            let row_start = (y * width * 3) as usize;
-            let row_end = row_start + (width * 3) as usize;
-            padded_data.extend_from_slice(&bgr_data[row_start..row_end]);
-            // Add padding
-            for _ in 0..(row_size - width * 3) {
-                padded_data.push(0);
-            }
-        }
-
-        // Draw the image
-        let result = StretchDIBits(
-            hdc,
-            0, 0, dest_width, dest_height,  // Destination
-            0, 0, width as i32, height as i32,  // Source
-            Some(padded_data.as_ptr() as *const _),
-            &bmi,
-            DIB_RGB_COLORS,
-            SRCCOPY,
-        );
-
-        if result == 0 {
-            EndPage(hdc);
-            EndDoc(hdc);
-            DeleteDC(hdc);
-            return Err("Failed to draw image to printer".to_string());
-        }
-
-        // End page and document
-        EndPage(hdc);
-        EndDoc(hdc);
-        DeleteDC(hdc);
+    if output.status.success() {
+        Ok(PrintResult {
+            success: true,
+            size_kb,
+            message: format!("Printed via SumatraPDF to {}", printer_name),
+        })
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(format!(
+            "SumatraPDF print failed (exit code {:?}). stdout: {} stderr: {}",
+            output.status.code(),
+            stdout,
+            stderr
+        ))
     }
-
-    Ok(PrintResult {
-        success: true,
-        size_kb,
-        message: format!("Printed {}x{} image to {}", width, height, printer_name),
-    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

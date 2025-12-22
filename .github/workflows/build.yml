@@ -23,16 +23,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download PDFium (v7592)
+      - name: Download SumatraPDF (for silent PDF printing)
         shell: bash
         run: |
-          echo "Downloading PDFium chromium/7592..."
-          curl -L -o pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7592/pdfium-win-x64.tgz"
-          mkdir -p pdfium-extracted
-          tar -xzf pdfium.tgz -C pdfium-extracted
-          ls -la pdfium-extracted/
-          ls -la pdfium-extracted/bin/ || true
-          cp pdfium-extracted/bin/pdfium.dll src-tauri/ || cp pdfium-extracted/pdfium.dll src-tauri/
+          echo "Downloading SumatraPDF 3.5.2 64-bit portable..."
+          curl -L -o src-tauri/SumatraPDF.exe "https://github.com/sumatrapdfreader/sumatrapdf/releases/download/3.5.2/SumatraPDF-3.5.2-64.exe"
+          ls -la src-tauri/SumatraPDF.exe
 
       - name: Install dependencies
         run: npm install
