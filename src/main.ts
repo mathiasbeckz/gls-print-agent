@@ -199,28 +199,39 @@ async function pollForJobs() {
 
 async function processJob(job: PrintJob) {
   const modeLabel = config.testMode ? " [TEST]" : "";
-  log(`${modeLabel} Behandler job ${job.id} med ${job.labelCount} labels...`, "info");
+  log(`${modeLabel} Behandler job ${job.id} med ${job.labelCount} labels (modtaget: ${job.labels.length})...`, "info");
 
   try {
     // Mark job as processing
     await updateJobStatus(job.id, "processing");
 
+    // Check if labels array is empty
+    if (job.labels.length === 0) {
+      throw new Error("Ingen labels modtaget fra server - tjek at shipments eksisterer i databasen");
+    }
+
+    let printedCount = 0;
+
     // Print each label
     for (const label of job.labels) {
       if (!label.labelPdf) {
-        log(`${modeLabel} Label ${label.shopifyOrderName} mangler PDF`, "error");
+        log(`${modeLabel} Label ${label.shopifyOrderName} mangler PDF data`, "error");
         continue;
       }
+
+      log(`${modeLabel} Printer ${label.shopifyOrderName}...`, "info");
 
       if (config.testMode) {
         // Test mode: just log what would be printed
         const pdfSizeKb = Math.round((label.labelPdf.length * 3) / 4 / 1024);
         log(`${modeLabel} Ville printe: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${pdfSizeKb} KB`, "success");
+        printedCount++;
       } else {
         // Real mode: actually print
         try {
           const result = await printPdf(label.labelPdf, label.shopifyOrderName);
           log(`Printet: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${result.size_kb} KB`, "success");
+          printedCount++;
         } catch (printError) {
           log(`Print fejl for ${label.shopifyOrderName}: ${printError}`, "error");
           throw printError;
@@ -228,16 +239,21 @@ async function processJob(job: PrintJob) {
       }
     }
 
+    // Only mark as completed if we actually printed something
+    if (printedCount === 0) {
+      throw new Error("Ingen labels blev printet - alle manglede PDF data");
+    }
+
     // Mark job as completed
     await updateJobStatus(job.id, "completed");
 
-    // Update stats
-    jobsToday += job.labelCount;
-    jobsTotal += job.labelCount;
+    // Update stats with actual printed count
+    jobsToday += printedCount;
+    jobsTotal += printedCount;
     updateStats();
     await saveStats();
 
-    log(`${modeLabel} Job ${job.id} fuldført`, "success");
+    log(`${modeLabel} Job ${job.id} fuldført (${printedCount} labels)`, "success");
   } catch (error) {
     log(`${modeLabel} Job fejl: ${error}`, "error");
     await updateJobStatus(job.id, "failed", String(error));
