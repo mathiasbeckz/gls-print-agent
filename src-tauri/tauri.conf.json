@@ -34,15 +34,16 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": {
-      "pdfium.dll": "./"
-    },
+    "resources": ["pdfium.dll"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     },
     "windows": {
       "certificateThumbprint": null,
-      "digestAlgorithm": "sha256"
+      "digestAlgorithm": "sha256",
+      "nsis": {
+        "installerIcon": "icons/icon.ico"
+      }
     }
   }
 }

@@ -23,14 +23,16 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Download PDFium
-        shell: pwsh
+      - name: Download PDFium (v7592)
+        shell: bash
         run: |
-          $pdfiumVersion = "6721"
-          $url = "https://github.com/ArtifexSoftware/pdfium-binaries/releases/download/pdfium-binaries-v$pdfiumVersion/pdfium-win-x64.zip"
-          Invoke-WebRequest -Uri $url -OutFile pdfium.zip
-          Expand-Archive -Path pdfium.zip -DestinationPath pdfium-extracted
-          Copy-Item "pdfium-extracted/bin/pdfium.dll" -Destination "src-tauri/"
+          echo "Downloading PDFium chromium/7592..."
+          curl -L -o pdfium.tgz "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F7592/pdfium-win-x64.tgz"
+          mkdir -p pdfium-extracted
+          tar -xzf pdfium.tgz -C pdfium-extracted
+          ls -la pdfium-extracted/
+          ls -la pdfium-extracted/bin/ || true
+          cp pdfium-extracted/bin/pdfium.dll src-tauri/ || cp pdfium-extracted/pdfium.dll src-tauri/
 
       - name: Install dependencies
         run: npm install

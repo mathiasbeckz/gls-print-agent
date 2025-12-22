@@ -1,7 +1,10 @@
 use std::process::Command;
-use tauri::Manager;
 use base64::Engine;
+
+#[cfg(target_os = "windows")]
 use pdfium_render::prelude::*;
+#[cfg(target_os = "windows")]
+use image::GenericImageView;
 
 // Get list of available printers
 #[tauri::command]

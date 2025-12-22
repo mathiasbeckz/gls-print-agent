@@ -24,11 +24,11 @@ tauri-plugin-log = "2"
 tauri-plugin-store = "2"
 base64 = "0.22"
 tempfile = "3"
-image = "0.25"
-pdfium-render = { version = "0.8", default-features = false, features = ["image"] }
 
 # For PDF printing on different platforms
 [target.'cfg(target_os = "windows")'.dependencies]
+image = "0.25"
+pdfium-render = { version = "0.8", default-features = false, features = ["image"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
