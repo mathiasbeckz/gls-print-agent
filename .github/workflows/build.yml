@@ -23,6 +23,15 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Download PDFium
+        shell: pwsh
+        run: |
+          $pdfiumVersion = "6721"
+          $url = "https://github.com/ArtifexSoftware/pdfium-binaries/releases/download/pdfium-binaries-v$pdfiumVersion/pdfium-win-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile pdfium.zip
+          Expand-Archive -Path pdfium.zip -DestinationPath pdfium-extracted
+          Copy-Item "pdfium-extracted/bin/pdfium.dll" -Destination "src-tauri/"
+
       - name: Install dependencies
         run: npm install
 
