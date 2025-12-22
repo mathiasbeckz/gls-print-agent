@@ -34,7 +34,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["SumatraPDF.exe"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     },
