@@ -23,16 +23,19 @@ fn get_printers() -> Result<Vec<String>, String> {
 
     #[cfg(target_os = "windows")]
     {
-        // Use wmic which is more reliable than PowerShell on some systems
-        let output = Command::new("wmic")
-            .args(["printer", "get", "name"])
+        // Use PowerShell with WMI (works on all Windows versions including Windows 11)
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-WmiObject -Class Win32_Printer | Select-Object -ExpandProperty Name"
+            ])
             .output()
             .map_err(|e| e.to_string())?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let printers: Vec<String> = stdout
             .lines()
-            .skip(1) // Skip header "Name"
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
