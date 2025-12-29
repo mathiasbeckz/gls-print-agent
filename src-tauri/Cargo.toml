@@ -1,6 +1,6 @@
 [package]
 name = "gls-print-agent"
-version = "0.5.1"
+version = "0.5.2"
 description = "GLS Print Agent for remote label printing"
 authors = ["Josephine Nord"]
 license = "MIT"
