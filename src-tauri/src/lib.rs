@@ -1,5 +1,11 @@
 use std::process::Command;
 use base64::Engine;
+use tauri::{
+    Manager,
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    menu::{Menu, MenuItem},
+    image::Image,
+};
 
 // Get list of available printers
 #[tauri::command]
@@ -197,7 +203,54 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            // Create system tray menu
+            let show_item = MenuItem::with_id(app, "show", "Åbn", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Afslut", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            // Load tray icon from app icons
+            let icon = Image::from_path("icons/32x32.png")
+                .unwrap_or_else(|_| Image::from_bytes(include_bytes!("../icons/32x32.png")).unwrap());
+
+            // Create system tray
+            let _tray = TrayIconBuilder::new()
+                .icon(icon)
+                .menu(&menu)
+                .tooltip("GLS Print Agent")
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Hide window instead of closing when X is clicked
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
         })
         .invoke_handler(tauri::generate_handler![get_printers, print_pdf])
         .run(tauri::generate_context!())
