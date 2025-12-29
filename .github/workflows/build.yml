@@ -26,8 +26,10 @@ jobs:
       - name: Download SumatraPDF (for silent PDF printing)
         shell: bash
         run: |
-          echo "Downloading SumatraPDF 3.5.2 32-bit portable (works on both 32-bit and 64-bit Windows)..."
-          curl -L -o src-tauri/SumatraPDF.exe "https://github.com/sumatrapdfreader/sumatrapdf/releases/download/3.5.2/SumatraPDF-3.5.2-32.exe"
+          echo "Downloading SumatraPDF 3.5.2 64-bit portable..."
+          curl -L -o sumatra.zip "https://www.sumatrapdfreader.org/dl/rel/3.5.2/SumatraPDF-3.5.2-64.zip"
+          unzip sumatra.zip -d sumatra-extracted
+          mv sumatra-extracted/SumatraPDF-3.5.2-64.exe src-tauri/SumatraPDF.exe
           ls -la src-tauri/SumatraPDF.exe
 
       - name: Install dependencies
