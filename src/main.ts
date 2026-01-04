@@ -30,6 +30,7 @@ let config: Config = {
   testMode: false,
 };
 let isRunning = false;
+let isPolling = false; // Prevents overlapping polls
 let pollInterval: number | null = null;
 let store: Store;
 let jobsToday = 0;
@@ -156,6 +157,7 @@ function startPolling() {
 
 function stopPolling() {
   isRunning = false;
+  isPolling = false; // Reset polling lock
   startStopBtn.textContent = "Start";
   startStopBtn.classList.remove("danger");
   startStopBtn.classList.add("secondary");
@@ -170,6 +172,13 @@ function stopPolling() {
 }
 
 async function pollForJobs() {
+  // Prevent overlapping polls - if previous poll is still processing, skip this one
+  if (isPolling) {
+    return;
+  }
+
+  isPolling = true;
+
   try {
     const response = await fetch(`${config.apiUrl}/api/print-jobs`, {
       headers: {
@@ -194,6 +203,8 @@ async function pollForJobs() {
   } catch (error) {
     setStatus("offline");
     log(`Polling fejl: ${error}`, "error");
+  } finally {
+    isPolling = false;
   }
 }
 
@@ -275,17 +286,18 @@ async function printPdf(base64Pdf: string, orderName: string): Promise<PrintResu
 }
 
 async function updateJobStatus(jobId: string, status: string, error?: string) {
-  try {
-    await fetch(`${config.apiUrl}/api/print-jobs`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        "X-API-Key": config.apiKey,
-      },
-      body: JSON.stringify({ jobId, status, error }),
-    });
-  } catch (e) {
-    console.error("Failed to update job status:", e);
+  const response = await fetch(`${config.apiUrl}/api/print-jobs`, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": config.apiKey,
+    },
+    body: JSON.stringify({ jobId, status, error }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "Unknown error");
+    throw new Error(`Failed to update job status to "${status}": HTTP ${response.status} - ${errorText}`);
   }
 }
 
