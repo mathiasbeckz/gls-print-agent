@@ -22,6 +22,10 @@ interface Config {
   testMode: boolean;
 }
 
+// Constants
+const FETCH_TIMEOUT_MS = 15000; // 15 seconds - abort hung requests
+const POLL_INTERVAL_MS = 3000; // 3 seconds between polls
+
 // State
 let config: Config = {
   apiUrl: "",
@@ -30,8 +34,7 @@ let config: Config = {
   testMode: false,
 };
 let isRunning = false;
-let isPolling = false; // Prevents overlapping polls
-let pollInterval: number | null = null;
+let pollTimeout: number | null = null;
 let store: Store;
 let jobsToday = 0;
 let jobsTotal = 0;
@@ -48,6 +51,16 @@ const activityLog = document.getElementById("activity-log")!;
 const jobsTodayEl = document.getElementById("jobs-today")!;
 const jobsTotalEl = document.getElementById("jobs-total")!;
 const appVersionEl = document.getElementById("app-version")!;
+
+// Fetch with timeout - prevents hung requests from deadlocking the agent
+function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => {
+    clearTimeout(timeoutId);
+  });
+}
 
 // Initialize
 async function init() {
@@ -150,37 +163,33 @@ function startPolling() {
     log("Starter polling...", "info");
   }
 
-  // Poll immediately, then every 3 seconds
+  // Poll immediately - next poll is scheduled after this one completes
   pollForJobs();
-  pollInterval = window.setInterval(pollForJobs, 3000);
 }
 
 function stopPolling() {
   isRunning = false;
-  isPolling = false; // Reset polling lock
   startStopBtn.textContent = "Start";
   startStopBtn.classList.remove("danger");
   startStopBtn.classList.add("secondary");
   setStatus("offline");
 
-  if (pollInterval) {
-    clearInterval(pollInterval);
-    pollInterval = null;
+  if (pollTimeout) {
+    clearTimeout(pollTimeout);
+    pollTimeout = null;
   }
 
   log("Polling stoppet", "info");
 }
 
+function scheduleNextPoll() {
+  if (!isRunning) return;
+  pollTimeout = window.setTimeout(pollForJobs, POLL_INTERVAL_MS);
+}
+
 async function pollForJobs() {
-  // Prevent overlapping polls - if previous poll is still processing, skip this one
-  if (isPolling) {
-    return;
-  }
-
-  isPolling = true;
-
   try {
-    const response = await fetch(`${config.apiUrl}/api/print-jobs`, {
+    const response = await fetchWithTimeout(`${config.apiUrl}/api/print-jobs`, {
       headers: {
         "X-API-Key": config.apiKey,
       },
@@ -202,9 +211,13 @@ async function pollForJobs() {
     }
   } catch (error) {
     setStatus("offline");
-    log(`Polling fejl: ${error}`, "error");
+    const message = error instanceof DOMException && error.name === "AbortError"
+      ? "Timeout - serveren svarede ikke inden 15 sek. Prøver igen..."
+      : `Polling fejl: ${error}`;
+    log(message, "error");
   } finally {
-    isPolling = false;
+    // Schedule next poll AFTER this one finishes - no overlap possible
+    scheduleNextPoll();
   }
 }
 
@@ -286,7 +299,7 @@ async function printPdf(base64Pdf: string, orderName: string): Promise<PrintResu
 }
 
 async function updateJobStatus(jobId: string, status: string, error?: string) {
-  const response = await fetch(`${config.apiUrl}/api/print-jobs`, {
+  const response = await fetchWithTimeout(`${config.apiUrl}/api/print-jobs`, {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
