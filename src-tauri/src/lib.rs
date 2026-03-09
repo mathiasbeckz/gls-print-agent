@@ -7,6 +7,33 @@ use tauri::{
     image::Image,
 };
 
+// Disable macOS App Nap to prevent the system from pausing our polling timers
+// when the window is hidden (minimized to tray).
+#[cfg(target_os = "macos")]
+fn disable_app_nap() {
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSString, NSAutoreleasePool};
+    use objc::{msg_send, sel, sel_impl, class};
+
+    unsafe {
+        let _pool = NSAutoreleasePool::new(nil);
+        let process_info: id = msg_send![class!(NSProcessInfo), processInfo];
+        let reason = NSString::alloc(nil).init_str("Print Agent must keep polling for print jobs");
+        // NSActivityUserInitiatedAllowingIdleSystemSleep = 0x00FFFFFFULL
+        // This prevents App Nap while still allowing the display to sleep
+        let _activity: id = msg_send![process_info,
+            beginActivityWithOptions: 0x00FFFFFFu64
+            reason: reason
+        ];
+        // We intentionally never end this activity — it should last the entire app lifetime
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn disable_app_nap() {
+    // No-op on non-macOS
+}
+
 // Get list of available printers
 #[tauri::command]
 fn get_printers() -> Result<Vec<String>, String> {
@@ -196,6 +223,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
+            // Disable App Nap so macOS doesn't pause our polling when minimized to tray
+            disable_app_nap();
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

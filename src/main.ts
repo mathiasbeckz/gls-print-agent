@@ -25,6 +25,8 @@ interface Config {
 // Constants
 const FETCH_TIMEOUT_MS = 15000; // 15 seconds - abort hung requests
 const POLL_INTERVAL_MS = 3000; // 3 seconds between polls
+const MAX_CONSECUTIVE_FAILURES = 5; // Only show offline after this many failures
+const DRIFT_THRESHOLD_MS = 10000; // If poll is delayed by more than 10s, system likely slept
 
 // State
 let config: Config = {
@@ -38,6 +40,8 @@ let pollTimeout: number | null = null;
 let store: Store;
 let jobsToday = 0;
 let jobsTotal = 0;
+let consecutiveFailures = 0;
+let lastPollTime = 0;
 
 // Elements
 const statusEl = document.getElementById("status")!;
@@ -98,6 +102,29 @@ async function init() {
   saveConfigBtn.addEventListener("click", saveConfig);
   startStopBtn.addEventListener("click", toggleRunning);
 
+  // Detect system wake / tab becoming visible — immediately re-poll
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && isRunning) {
+      log("App blev synlig igen, tjekker forbindelse...", "info");
+      resetPollTimer();
+    }
+  });
+
+  // Detect network coming back online
+  window.addEventListener("online", () => {
+    if (isRunning) {
+      log("Netværk genoprettet, genopretter forbindelse...", "info");
+      consecutiveFailures = 0;
+      resetPollTimer();
+    }
+  });
+
+  window.addEventListener("offline", () => {
+    if (isRunning) {
+      log("Netværk mistet", "error");
+    }
+  });
+
   log("Print Agent klar", "info");
 }
 
@@ -152,6 +179,7 @@ function startPolling() {
   }
 
   isRunning = true;
+  consecutiveFailures = 0;
   startStopBtn.textContent = "Stop";
   startStopBtn.classList.remove("secondary");
   startStopBtn.classList.add("danger");
@@ -164,11 +192,13 @@ function startPolling() {
   }
 
   // Poll immediately - next poll is scheduled after this one completes
+  lastPollTime = Date.now();
   pollForJobs();
 }
 
 function stopPolling() {
   isRunning = false;
+  consecutiveFailures = 0;
   startStopBtn.textContent = "Start";
   startStopBtn.classList.remove("danger");
   startStopBtn.classList.add("secondary");
@@ -182,9 +212,28 @@ function stopPolling() {
   log("Polling stoppet", "info");
 }
 
+// Cancel any pending poll and poll immediately
+function resetPollTimer() {
+  if (!isRunning) return;
+  if (pollTimeout) {
+    clearTimeout(pollTimeout);
+    pollTimeout = null;
+  }
+  pollForJobs();
+}
+
 function scheduleNextPoll() {
   if (!isRunning) return;
-  pollTimeout = window.setTimeout(pollForJobs, POLL_INTERVAL_MS);
+  lastPollTime = Date.now();
+  pollTimeout = window.setTimeout(() => {
+    // Detect timer drift (system sleep/App Nap)
+    const elapsed = Date.now() - lastPollTime;
+    if (elapsed > POLL_INTERVAL_MS + DRIFT_THRESHOLD_MS) {
+      log(`System var inaktivt i ${Math.round(elapsed / 1000)}s, genoptager polling...`, "info");
+      consecutiveFailures = 0; // Reset failures after wake
+    }
+    pollForJobs();
+  }, POLL_INTERVAL_MS);
 }
 
 async function pollForJobs() {
@@ -199,6 +248,8 @@ async function pollForJobs() {
       throw new Error(`HTTP ${response.status}`);
     }
 
+    // Success — reset failure counter and set online
+    consecutiveFailures = 0;
     setStatus("online");
     const data = await response.json();
 
@@ -210,11 +261,20 @@ async function pollForJobs() {
       }
     }
   } catch (error) {
-    setStatus("offline");
+    consecutiveFailures++;
+
     const message = error instanceof DOMException && error.name === "AbortError"
-      ? "Timeout - serveren svarede ikke inden 15 sek. Prøver igen..."
-      : `Polling fejl: ${error}`;
-    log(message, "error");
+      ? `Timeout (forsøg ${consecutiveFailures})...`
+      : `Polling fejl (forsøg ${consecutiveFailures}): ${error}`;
+
+    // Only show as error and set offline after multiple consecutive failures
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      setStatus("offline");
+      log(message, "error");
+    } else {
+      // Keep current status (online/connecting) during transient failures
+      log(message, "info");
+    }
   } finally {
     // Schedule next poll AFTER this one finishes - no overlap possible
     scheduleNextPoll();
