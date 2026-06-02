@@ -132,7 +132,7 @@ fn print_pdf(
     printer_name: String,
     job_name: String,
 ) -> Result<PrintResult, String> {
-    print_pdf_internal(&pdf_base64, &printer_name, &job_name)
+    print_pdf_internal(&pdf_base64, &printer_name, &job_name, "")
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +362,7 @@ fn print_pdf_internal(
     pdf_base64: &str,
     printer_name: &str,
     job_name: &str,
+    darkness: &str,
 ) -> Result<PrintResult, String> {
     // Decode base64 to bytes
     let pdf_bytes = base64::engine::general_purpose::STANDARD
@@ -387,11 +388,17 @@ fn print_pdf_internal(
     // Print using system command
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("lp")
-            .arg("-d")
+        let mut cmd = Command::new("lp");
+        cmd.arg("-d")
             .arg(printer_name)
             .arg("-t")
-            .arg(job_name)
+            .arg(job_name);
+        // Pass CUPS Darkness option to Zebra/thermal printer driver if set.
+        // The driver clamps to its supported range (Zebra GK420d: 1-30).
+        if !darkness.is_empty() {
+            cmd.arg("-o").arg(format!("Darkness={}", darkness));
+        }
+        let output = cmd
             .arg(&pdf_path)
             .output()
             .map_err(|e| format!("Failed to print: {}", e))?;
@@ -410,16 +417,23 @@ fn print_pdf_internal(
 
     #[cfg(target_os = "windows")]
     {
+        // SumatraPDF doesn't expose CUPS options; darkness is ignored on
+        // Windows. Configure it once in the printer driver instead.
+        let _ = darkness;
         print_pdf_windows(&pdf_path, printer_name, size_kb)
     }
 
     #[cfg(target_os = "linux")]
     {
-        let output = Command::new("lp")
-            .arg("-d")
+        let mut cmd = Command::new("lp");
+        cmd.arg("-d")
             .arg(printer_name)
             .arg("-t")
-            .arg(job_name)
+            .arg(job_name);
+        if !darkness.is_empty() {
+            cmd.arg("-o").arg(format!("Darkness={}", darkness));
+        }
+        let output = cmd
             .arg(&pdf_path)
             .output()
             .map_err(|e| format!("Failed to print: {}", e))?;
@@ -502,6 +516,12 @@ struct AgentConfig {
     selected_printer: String,
     #[serde(rename = "testMode")]
     test_mode: bool,
+    // CUPS Darkness option for Zebra/thermal printers. Empty string = use
+    // printer default (no -o flag); otherwise "1".."30" passed as
+    // `-o Darkness=N` to the lp command. macOS/Linux only — Windows uses
+    // SumatraPDF which does not expose CUPS options.
+    #[serde(default, rename = "printDarkness")]
+    print_darkness: String,
 }
 
 // Runtime state shared between Tauri commands and the polling task.
@@ -791,11 +811,12 @@ async fn process_job(
             let job_name = format!("GLS Label - {}", label.shopify_order_name);
             let pdf_owned = pdf.clone();
             let printer_owned = cfg.selected_printer.clone();
+            let darkness_owned = cfg.print_darkness.clone();
             // Run native printing on a blocking thread so we don't block the
             // tokio reactor while `lp` / SumatraPDF runs.
             let print_outcome: Result<PrintResult, String> =
                 match tokio::task::spawn_blocking(move || {
-                    print_pdf_internal(&pdf_owned, &printer_owned, &job_name)
+                    print_pdf_internal(&pdf_owned, &printer_owned, &job_name, &darkness_owned)
                 })
                 .await
                 {

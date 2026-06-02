@@ -22,6 +22,7 @@ interface Config {
   apiKey: string;
   selectedPrinter: string;
   testMode: boolean;
+  printDarkness: string; // "" = printer default, otherwise "1".."30"
 }
 
 type AgentEvent =
@@ -35,6 +36,7 @@ let config: Config = {
   apiKey: "",
   selectedPrinter: "",
   testMode: false,
+  printDarkness: "",
 };
 let isRunning = false;
 let store: Store;
@@ -47,6 +49,7 @@ const apiUrlInput = document.getElementById("api-url") as HTMLInputElement;
 const apiKeyInput = document.getElementById("api-key") as HTMLInputElement;
 const printerSelect = document.getElementById("printer-select") as HTMLSelectElement;
 const testModeCheckbox = document.getElementById("test-mode") as HTMLInputElement;
+const darknessInput = document.getElementById("darkness") as HTMLInputElement;
 const saveConfigBtn = document.getElementById("save-config")!;
 const startStopBtn = document.getElementById("start-stop")!;
 const activityLog = document.getElementById("activity-log")!;
@@ -68,10 +71,11 @@ async function init() {
   // Load saved config
   const savedConfig = await store.get<Config>("config");
   if (savedConfig) {
-    config = savedConfig;
+    config = { printDarkness: "", ...savedConfig };
     apiUrlInput.value = config.apiUrl;
     apiKeyInput.value = config.apiKey;
     testModeCheckbox.checked = config.testMode || false;
+    darknessInput.value = config.printDarkness || "";
     // Push the loaded config into Rust state immediately so a Start click
     // doesn't need to wait for the save button.
     await invoke("update_config", { config });
@@ -141,6 +145,13 @@ async function saveConfig() {
   config.apiKey = apiKeyInput.value;
   config.selectedPrinter = printerSelect.value;
   config.testMode = testModeCheckbox.checked;
+  // Normalise darkness: empty / 0 / out-of-range → use printer default
+  const darknessRaw = darknessInput.value.trim();
+  const darknessNum = parseInt(darknessRaw, 10);
+  config.printDarkness =
+    darknessRaw && !isNaN(darknessNum) && darknessNum >= 1 && darknessNum <= 30
+      ? String(darknessNum)
+      : "";
 
   await store.set("config", config);
   await store.save();
