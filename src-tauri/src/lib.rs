@@ -147,9 +147,9 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
 // Logo placement in PDF points (1pt = 1/72 inch). Tuned for the 100×150mm GLS
 // label format and sized to visually balance GLS's own logo in the opposite
 // (bottom-right) corner without intruding on the barcode or notes area.
-const LOGO_WIDTH_PT: f32 = 85.0;     // ~30 mm
+const LOGO_WIDTH_PT: f32 = 102.0;    // ~36 mm (20% larger)
 const LOGO_MARGIN_LEFT_PT: f32 = 19.0; // ~6.7 mm from left edge
-const LOGO_MARGIN_BOTTOM_PT: f32 = 2.0; // ~0.7 mm from bottom edge
+const LOGO_MARGIN_BOTTOM_PT: f32 = -2.0; // tucked into the extra bottom strip the GK420d gives us
 
 // Public wrapper so the `test_watermark` example binary can call it without
 // going through Tauri. Production code paths call add_logo_watermark below.
