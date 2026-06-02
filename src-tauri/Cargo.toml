@@ -1,6 +1,6 @@
 [package]
 name = "gls-print-agent"
-version = "0.7.0"
+version = "0.8.0"
 description = "GLS Print Agent for remote label printing"
 authors = ["Josephine Nord"]
 license = "MIT"
@@ -30,6 +30,12 @@ tempfile = "3"
 # TS-side fetch loop could not, due to WKWebView background throttling.
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tokio = { version = "1", features = ["full"] }
+# PDF manipulation for watermarking labels with the merchant's logo before
+# printing. lopdf parses and re-saves the GLS PDF; image decodes the embedded
+# logo PNG; flate2 compresses the raw RGB bytes for the PDF image XObject.
+lopdf = "0.36"
+image = { version = "0.25", default-features = false, features = ["png"] }
+flate2 = "1"
 
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]

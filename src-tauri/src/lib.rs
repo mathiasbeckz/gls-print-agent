@@ -4,7 +4,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use lopdf::{dictionary, Document, Object, ObjectId, Stream};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -131,6 +135,229 @@ fn print_pdf(
     print_pdf_internal(&pdf_base64, &printer_name, &job_name)
 }
 
+// ---------------------------------------------------------------------------
+// PDF watermarking
+// ---------------------------------------------------------------------------
+
+// Logo bundled into the binary at compile time. To change it, replace the
+// file and rebuild. Keep it transparent-PNG so the composite-on-white below
+// produces a clean black-on-white render that matches the rest of the label.
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo.png");
+
+// Logo placement in PDF points (1pt = 1/72 inch). Tuned for the 100×150mm GLS
+// label format and sized to visually balance GLS's own logo in the opposite
+// (bottom-right) corner without intruding on the barcode or notes area.
+const LOGO_WIDTH_PT: f32 = 85.0;     // ~30 mm
+const LOGO_MARGIN_LEFT_PT: f32 = 19.0; // ~6.7 mm from left edge
+const LOGO_MARGIN_BOTTOM_PT: f32 = 2.0; // ~0.7 mm from bottom edge
+
+// Public wrapper so the `test_watermark` example binary can call it without
+// going through Tauri. Production code paths call add_logo_watermark below.
+pub fn add_logo_watermark_for_test(pdf_bytes: Vec<u8>) -> Vec<u8> {
+    add_logo_watermark(pdf_bytes)
+}
+
+// Embed the logo onto the first page of the supplied PDF in the bottom-left
+// corner. Returns the modified PDF bytes. The original page content is
+// preserved — we append a new content stream that draws the image on top
+// using a Form XObject reference.
+//
+// On any error we return the original bytes so a malformed PDF still gets
+// printed; we never want a label to fail to print just because we couldn't
+// watermark it.
+fn add_logo_watermark(pdf_bytes: Vec<u8>) -> Vec<u8> {
+    match try_watermark(&pdf_bytes) {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("[watermark] failed, printing un-watermarked: {}", e);
+            pdf_bytes
+        }
+    }
+}
+
+fn try_watermark(pdf_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    // 1) Decode the logo PNG and composite onto a white background so we don't
+    //    have to deal with PDF soft masks. Labels are pure white in the area
+    //    we're placing the logo, so the result is visually identical to
+    //    actual transparency.
+    let logo = image::load_from_memory(LOGO_PNG)
+        .map_err(|e| format!("decode logo PNG: {}", e))?;
+    let rgba = logo.to_rgba8();
+    let (img_w, img_h) = rgba.dimensions();
+
+    let mut rgb_bytes = Vec::with_capacity((img_w * img_h * 3) as usize);
+    for pixel in rgba.pixels() {
+        let [r, g, b, a] = pixel.0;
+        let alpha = a as f32 / 255.0;
+        let blend = |c: u8| -> u8 {
+            (c as f32 * alpha + 255.0 * (1.0 - alpha)).round() as u8
+        };
+        rgb_bytes.push(blend(r));
+        rgb_bytes.push(blend(g));
+        rgb_bytes.push(blend(b));
+    }
+
+    // 2) FlateDecode-compress the raw RGB bytes for the PDF image XObject.
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&rgb_bytes)
+        .map_err(|e| format!("compress logo: {}", e))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|e| format!("finalize logo compression: {}", e))?;
+
+    // 3) Parse the PDF
+    let mut doc = Document::load_mem(pdf_bytes).map_err(|e| format!("parse PDF: {}", e))?;
+
+    // 4) Build the image XObject and register it on the document
+    let image_xobject = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => img_w as i64,
+            "Height" => img_h as i64,
+            "ColorSpace" => "DeviceRGB",
+            "BitsPerComponent" => 8,
+            "Filter" => "FlateDecode",
+        },
+        compressed,
+    );
+    let image_id = doc.add_object(Object::Stream(image_xobject));
+
+    // 5) Find the first page
+    let pages = doc.get_pages();
+    let first_page_id = *pages
+        .values()
+        .next()
+        .ok_or_else(|| "PDF has no pages".to_string())?;
+
+    // 6) Add the image to the page's resources under a fresh name. Use a
+    //    long, unlikely-to-collide name so we don't clash with existing
+    //    XObjects in the source PDF.
+    let resource_name = b"JNLogoWatermark";
+    add_xobject_to_page_resources(&mut doc, first_page_id, resource_name, image_id)?;
+
+    // 7) Build a content stream that draws the image at the configured
+    //    position and size. The 'cm' operator concatenates a transformation
+    //    matrix: [a b c d e f] where a/d are scaling and e/f are translation.
+    //    To draw an XObject at (x, y) sized w × h: w 0 0 h x y cm /Name Do.
+    //    Logo aspect ratio is derived from the image so height comes out
+    //    right regardless of which logo file is bundled.
+    let logo_height_pt = LOGO_WIDTH_PT * (img_h as f32) / (img_w as f32);
+    let content_ops = format!(
+        "q\n{} 0 0 {} {} {} cm\n/{} Do\nQ\n",
+        format_num(LOGO_WIDTH_PT),
+        format_num(logo_height_pt),
+        format_num(LOGO_MARGIN_LEFT_PT),
+        format_num(LOGO_MARGIN_BOTTOM_PT),
+        std::str::from_utf8(resource_name).unwrap()
+    );
+    let watermark_stream = Stream::new(dictionary! {}, content_ops.into_bytes());
+    let watermark_id = doc.add_object(Object::Stream(watermark_stream));
+
+    // 8) Append our content stream to the page's content stream array. PDF
+    //    allows /Contents to be either a single stream or an array of
+    //    streams; we normalise to array and push the watermark on the end.
+    append_to_page_contents(&mut doc, first_page_id, watermark_id)?;
+
+    // 9) Serialize the modified document
+    let mut out = Vec::new();
+    doc.save_to(&mut out)
+        .map_err(|e| format!("save PDF: {}", e))?;
+    Ok(out)
+}
+
+fn add_xobject_to_page_resources(
+    doc: &mut Document,
+    page_id: ObjectId,
+    name: &[u8],
+    xobject_id: ObjectId,
+) -> Result<(), String> {
+    // Get or create the page's /Resources dict (PDFs sometimes inherit it
+    // from the parent /Pages node; if so we copy onto the page directly so
+    // our addition doesn't leak to siblings).
+    let page_dict = doc
+        .get_object_mut(page_id)
+        .map_err(|e| format!("get page: {}", e))?
+        .as_dict_mut()
+        .map_err(|e| format!("page not a dict: {}", e))?;
+
+    let mut resources = match page_dict.get(b"Resources") {
+        Ok(Object::Dictionary(d)) => d.clone(),
+        Ok(Object::Reference(_)) => {
+            // Inherit-by-reference is fine for read; for write we replace
+            // with our own copy of the deref'd dict.
+            let res_ref = page_dict.get(b"Resources").unwrap().clone();
+            let resolved = match res_ref {
+                Object::Reference(id) => doc
+                    .get_object(id)
+                    .map_err(|e| format!("resolve resources: {}", e))?
+                    .as_dict()
+                    .map_err(|e| format!("resources not a dict: {}", e))?
+                    .clone(),
+                _ => unreachable!(),
+            };
+            resolved
+        }
+        _ => lopdf::Dictionary::new(),
+    };
+
+    // Add or extend the XObject sub-dict
+    let mut xobject_dict = match resources.get(b"XObject") {
+        Ok(Object::Dictionary(d)) => d.clone(),
+        _ => lopdf::Dictionary::new(),
+    };
+    xobject_dict.set(name.to_vec(), Object::Reference(xobject_id));
+    resources.set("XObject", xobject_dict);
+
+    // Write resources back to the page
+    let page_dict = doc
+        .get_object_mut(page_id)
+        .map_err(|e| format!("get page (write): {}", e))?
+        .as_dict_mut()
+        .map_err(|e| format!("page not a dict (write): {}", e))?;
+    page_dict.set("Resources", resources);
+
+    Ok(())
+}
+
+fn append_to_page_contents(
+    doc: &mut Document,
+    page_id: ObjectId,
+    new_content_id: ObjectId,
+) -> Result<(), String> {
+    let page_dict = doc
+        .get_object_mut(page_id)
+        .map_err(|e| format!("get page for contents: {}", e))?
+        .as_dict_mut()
+        .map_err(|e| format!("page not a dict: {}", e))?;
+
+    let new_contents = match page_dict.get(b"Contents") {
+        Ok(Object::Array(arr)) => {
+            let mut arr = arr.clone();
+            arr.push(Object::Reference(new_content_id));
+            Object::Array(arr)
+        }
+        Ok(Object::Reference(existing)) => {
+            Object::Array(vec![Object::Reference(*existing), Object::Reference(new_content_id)])
+        }
+        _ => Object::Array(vec![Object::Reference(new_content_id)]),
+    };
+
+    page_dict.set("Contents", new_contents);
+    Ok(())
+}
+
+// PDF expects fractional numbers without trailing zeros and a '.' separator.
+fn format_num(n: f32) -> String {
+    let s = format!("{:.3}", n);
+    // strip trailing zeros and possible trailing '.'
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() }
+}
+
+// ---------------------------------------------------------------------------
+
 fn print_pdf_internal(
     pdf_base64: &str,
     printer_name: &str,
@@ -140,6 +367,11 @@ fn print_pdf_internal(
     let pdf_bytes = base64::engine::general_purpose::STANDARD
         .decode(pdf_base64)
         .map_err(|e| format!("Failed to decode PDF: {}", e))?;
+
+    // Watermark with merchant logo. add_logo_watermark falls back to the
+    // original bytes on any internal failure so a watermark bug can never
+    // block printing.
+    let pdf_bytes = add_logo_watermark(pdf_bytes);
 
     let size_kb = pdf_bytes.len() / 1024;
 
