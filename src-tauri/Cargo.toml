@@ -1,6 +1,6 @@
 [package]
 name = "gls-print-agent"
-version = "0.6.3"
+version = "0.7.0"
 description = "GLS Print Agent for remote label printing"
 authors = ["Josephine Nord"]
 license = "MIT"
@@ -24,6 +24,12 @@ tauri-plugin-log = "2"
 tauri-plugin-store = "2"
 base64 = "0.22"
 tempfile = "3"
+# HTTP client + async runtime for the background polling task that drives
+# label fetching. Lives in Rust (not the WebView) so it keeps running while
+# the window is minimised, hidden, or behind other apps — which the previous
+# TS-side fetch loop could not, due to WKWebView background throttling.
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
 
 # macOS-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]

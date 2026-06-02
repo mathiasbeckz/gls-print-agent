@@ -1,20 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { Store } from "@tauri-apps/plugin-store";
 
-// Types
-interface PrintJob {
-  id: string;
-  labelCount: number;
-  createdAt: string;
-  labels: Array<{
-    id: string;
-    shopifyOrderName: string;
-    labelPdf: string;
-    glsTrackingNumber: string;
-  }>;
-}
+// Polling, fetching and printing all live in Rust (src-tauri/src/lib.rs) now.
+// This file is only responsible for:
+//   - Loading / persisting the saved config and stats via tauri-plugin-store
+//   - Forwarding Start / Stop / save-config button clicks to Rust commands
+//   - Listening for "agent_event" events emitted by the Rust polling task
+//     and updating the DOM (status badge, activity log, stats)
+//
+// The previous version's setTimeout-based poll loop ran inside the WebView
+// and was throttled to a crawl by WKWebView whenever the window was hidden
+// (minimized, behind other windows, system idle). That is why the agent
+// went offline on macOS until the window was clicked. Moving the poll
+// loop into a tokio task on the Rust side avoids that throttling entirely.
 
+// Types
 interface Config {
   apiUrl: string;
   apiKey: string;
@@ -22,11 +24,10 @@ interface Config {
   testMode: boolean;
 }
 
-// Constants
-const FETCH_TIMEOUT_MS = 15000; // 15 seconds - abort hung requests
-const POLL_INTERVAL_MS = 3000; // 3 seconds between polls
-const MAX_CONSECUTIVE_FAILURES = 5; // Only show offline after this many failures
-const DRIFT_THRESHOLD_MS = 10000; // If poll is delayed by more than 10s, system likely slept
+type AgentEvent =
+  | { kind: "status_changed"; status: "online" | "offline" | "connecting" }
+  | { kind: "log_added"; message: string; level: "info" | "success" | "error" }
+  | { kind: "stats_updated"; today: number; total: number };
 
 // State
 let config: Config = {
@@ -36,12 +37,9 @@ let config: Config = {
   testMode: false,
 };
 let isRunning = false;
-let pollTimeout: number | null = null;
 let store: Store;
 let jobsToday = 0;
 let jobsTotal = 0;
-let consecutiveFailures = 0;
-let lastPollTime = 0;
 
 // Elements
 const statusEl = document.getElementById("status")!;
@@ -56,17 +54,6 @@ const jobsTodayEl = document.getElementById("jobs-today")!;
 const jobsTotalEl = document.getElementById("jobs-total")!;
 const appVersionEl = document.getElementById("app-version")!;
 
-// Fetch with timeout - prevents hung requests from deadlocking the agent
-function fetchWithTimeout(url: string, options: RequestInit = {}): Promise<Response> {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-  return fetch(url, { ...options, signal: controller.signal }).finally(() => {
-    clearTimeout(timeoutId);
-  });
-}
-
-// Initialize
 async function init() {
   // Show app version
   try {
@@ -75,7 +62,7 @@ async function init() {
   } catch {
     appVersionEl.textContent = "v?";
   }
-  // Initialize store
+
   store = await Store.load("config.json");
 
   // Load saved config
@@ -85,47 +72,49 @@ async function init() {
     apiUrlInput.value = config.apiUrl;
     apiKeyInput.value = config.apiKey;
     testModeCheckbox.checked = config.testMode || false;
+    // Push the loaded config into Rust state immediately so a Start click
+    // doesn't need to wait for the save button.
+    await invoke("update_config", { config });
   }
 
-  // Load stats
+  // Load stats and sync to Rust so the counters survive restarts
   const savedStats = await store.get<{ today: number; total: number }>("stats");
   if (savedStats) {
     jobsToday = savedStats.today;
     jobsTotal = savedStats.total;
     updateStats();
+    await invoke("set_stats", { today: jobsToday, total: jobsTotal });
   }
 
-  // Load printers
   await loadPrinters();
 
-  // Set up event listeners
+  // Listen for events emitted by the Rust polling task
+  await listen<AgentEvent>("agent_event", (event) => {
+    handleAgentEvent(event.payload);
+  });
+
+  // UI event handlers
   saveConfigBtn.addEventListener("click", saveConfig);
   startStopBtn.addEventListener("click", toggleRunning);
 
-  // Detect system wake / tab becoming visible — immediately re-poll
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && isRunning) {
-      log("App blev synlig igen, tjekker forbindelse...", "info");
-      resetPollTimer();
-    }
-  });
-
-  // Detect network coming back online
-  window.addEventListener("online", () => {
-    if (isRunning) {
-      log("Netværk genoprettet, genopretter forbindelse...", "info");
-      consecutiveFailures = 0;
-      resetPollTimer();
-    }
-  });
-
-  window.addEventListener("offline", () => {
-    if (isRunning) {
-      log("Netværk mistet", "error");
-    }
-  });
-
   log("Print Agent klar", "info");
+}
+
+function handleAgentEvent(event: AgentEvent) {
+  switch (event.kind) {
+    case "status_changed":
+      setStatus(event.status);
+      break;
+    case "log_added":
+      log(event.message, event.level);
+      break;
+    case "stats_updated":
+      jobsToday = event.today;
+      jobsTotal = event.total;
+      updateStats();
+      saveStats().catch(() => {/* non-fatal */});
+      break;
+  }
 }
 
 async function loadPrinters() {
@@ -155,19 +144,20 @@ async function saveConfig() {
 
   await store.set("config", config);
   await store.save();
+  await invoke("update_config", { config });
 
   log("Konfiguration gemt" + (config.testMode ? " (test-tilstand)" : ""), "success");
 }
 
-function toggleRunning() {
+async function toggleRunning() {
   if (isRunning) {
-    stopPolling();
+    await stopPolling();
   } else {
-    startPolling();
+    await startPolling();
   }
 }
 
-function startPolling() {
+async function startPolling() {
   if (!config.apiUrl || !config.apiKey) {
     log("Udfyld API URL og API nøgle først", "error");
     return;
@@ -178,8 +168,10 @@ function startPolling() {
     return;
   }
 
+  // Ensure Rust has the latest config before starting
+  await invoke("update_config", { config });
+
   isRunning = true;
-  consecutiveFailures = 0;
   startStopBtn.textContent = "Stop";
   startStopBtn.classList.remove("secondary");
   startStopBtn.classList.add("danger");
@@ -191,194 +183,27 @@ function startPolling() {
     log("Starter polling...", "info");
   }
 
-  // Poll immediately - next poll is scheduled after this one completes
-  lastPollTime = Date.now();
-  pollForJobs();
+  await invoke("start_polling");
 }
 
-function stopPolling() {
+async function stopPolling() {
+  await invoke("stop_polling");
   isRunning = false;
-  consecutiveFailures = 0;
   startStopBtn.textContent = "Start";
   startStopBtn.classList.remove("danger");
   startStopBtn.classList.add("secondary");
   setStatus("offline");
-
-  if (pollTimeout) {
-    clearTimeout(pollTimeout);
-    pollTimeout = null;
-  }
-
   log("Polling stoppet", "info");
-}
-
-// Cancel any pending poll and poll immediately
-function resetPollTimer() {
-  if (!isRunning) return;
-  if (pollTimeout) {
-    clearTimeout(pollTimeout);
-    pollTimeout = null;
-  }
-  pollForJobs();
-}
-
-function scheduleNextPoll() {
-  if (!isRunning) return;
-  lastPollTime = Date.now();
-  pollTimeout = window.setTimeout(() => {
-    // Detect timer drift (system sleep/App Nap)
-    const elapsed = Date.now() - lastPollTime;
-    if (elapsed > POLL_INTERVAL_MS + DRIFT_THRESHOLD_MS) {
-      log(`System var inaktivt i ${Math.round(elapsed / 1000)}s, genoptager polling...`, "info");
-      consecutiveFailures = 0; // Reset failures after wake
-    }
-    pollForJobs();
-  }, POLL_INTERVAL_MS);
-}
-
-async function pollForJobs() {
-  try {
-    const response = await fetchWithTimeout(`${config.apiUrl}/api/print-jobs`, {
-      headers: {
-        "X-API-Key": config.apiKey,
-      },
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-
-    // Success — reset failure counter and set online
-    consecutiveFailures = 0;
-    setStatus("online");
-    const data = await response.json();
-
-    if (data.jobs && data.jobs.length > 0) {
-      log(`Fandt ${data.jobs.length} print job(s)`, "info");
-
-      for (const job of data.jobs) {
-        await processJob(job);
-      }
-    }
-  } catch (error) {
-    consecutiveFailures++;
-
-    const message = error instanceof DOMException && error.name === "AbortError"
-      ? `Timeout (forsøg ${consecutiveFailures})...`
-      : `Polling fejl (forsøg ${consecutiveFailures}): ${error}`;
-
-    // Only show as error and set offline after multiple consecutive failures
-    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-      setStatus("offline");
-      log(message, "error");
-    } else {
-      // Keep current status (online/connecting) during transient failures
-      log(message, "info");
-    }
-  } finally {
-    // Schedule next poll AFTER this one finishes - no overlap possible
-    scheduleNextPoll();
-  }
-}
-
-async function processJob(job: PrintJob) {
-  const modeLabel = config.testMode ? " [TEST]" : "";
-  log(`${modeLabel} Behandler job ${job.id} med ${job.labelCount} labels (modtaget: ${job.labels.length})...`, "info");
-
-  try {
-    // Mark job as processing
-    await updateJobStatus(job.id, "processing");
-
-    // Check if labels array is empty
-    if (job.labels.length === 0) {
-      throw new Error("Ingen labels modtaget fra server - tjek at shipments eksisterer i databasen");
-    }
-
-    let printedCount = 0;
-
-    // Print each label
-    for (const label of job.labels) {
-      if (!label.labelPdf) {
-        log(`${modeLabel} Label ${label.shopifyOrderName} mangler PDF data`, "error");
-        continue;
-      }
-
-      log(`${modeLabel} Printer ${label.shopifyOrderName}...`, "info");
-
-      if (config.testMode) {
-        // Test mode: just log what would be printed
-        const pdfSizeKb = Math.round((label.labelPdf.length * 3) / 4 / 1024);
-        log(`${modeLabel} Ville printe: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${pdfSizeKb} KB`, "success");
-        printedCount++;
-      } else {
-        // Real mode: actually print
-        try {
-          const result = await printPdf(label.labelPdf, label.shopifyOrderName);
-          log(`Printet: ${label.shopifyOrderName} (${label.glsTrackingNumber}) - ${result.size_kb} KB`, "success");
-          printedCount++;
-        } catch (printError) {
-          log(`Print fejl for ${label.shopifyOrderName}: ${printError}`, "error");
-          throw printError;
-        }
-      }
-    }
-
-    // Only mark as completed if we actually printed something
-    if (printedCount === 0) {
-      throw new Error("Ingen labels blev printet - alle manglede PDF data");
-    }
-
-    // Mark job as completed
-    await updateJobStatus(job.id, "completed");
-
-    // Update stats with actual printed count
-    jobsToday += printedCount;
-    jobsTotal += printedCount;
-    updateStats();
-    await saveStats();
-
-    log(`${modeLabel} Job ${job.id} fuldført (${printedCount} labels)`, "success");
-  } catch (error) {
-    log(`${modeLabel} Job fejl: ${error}`, "error");
-    await updateJobStatus(job.id, "failed", String(error));
-  }
-}
-
-interface PrintResult {
-  success: boolean;
-  size_kb: number;
-  message: string;
-}
-
-async function printPdf(base64Pdf: string, orderName: string): Promise<PrintResult> {
-  return await invoke("print_pdf", {
-    pdfBase64: base64Pdf,
-    printerName: config.selectedPrinter,
-    jobName: `GLS Label - ${orderName}`,
-  });
-}
-
-async function updateJobStatus(jobId: string, status: string, error?: string) {
-  const response = await fetchWithTimeout(`${config.apiUrl}/api/print-jobs`, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "application/json",
-      "X-API-Key": config.apiKey,
-    },
-    body: JSON.stringify({ jobId, status, error }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "Unknown error");
-    throw new Error(`Failed to update job status to "${status}": HTTP ${response.status} - ${errorText}`);
-  }
 }
 
 function setStatus(status: "online" | "offline" | "connecting") {
   statusEl.className = `status ${status}`;
   statusEl.textContent =
-    status === "online" ? "Forbundet" :
-    status === "connecting" ? "Forbinder..." : "Ikke forbundet";
+    status === "online"
+      ? "Forbundet"
+      : status === "connecting"
+        ? "Forbinder..."
+        : "Ikke forbundet";
 }
 
 function log(message: string, type: "info" | "success" | "error") {
