@@ -548,7 +548,11 @@ impl Default for AgentState {
 
 // Constants kept in sync with the previous TS implementation. Adjusting here
 // changes behaviour for everyone (Mac/Windows/Linux).
-const FETCH_TIMEOUT_MS: u64 = 15_000;
+// Covers the whole request, body download included. The server now chunks
+// print jobs so responses stay around 1 MB, but a Neon cold start can still
+// add several seconds before the first byte — 30 s leaves room for that
+// without letting a genuinely dead request block polling for long.
+const FETCH_TIMEOUT_MS: u64 = 30_000;
 const POLL_INTERVAL_MS: u64 = 3_000;
 const MAX_CONSECUTIVE_FAILURES: u32 = 5;
 const DRIFT_THRESHOLD_MS: u128 = 10_000;
@@ -685,7 +689,20 @@ async fn poll_loop(app: AppHandle, state: Arc<AgentState>) {
                     }
                     Err(e) => {
                         consecutive_failures += 1;
-                        log_polling_failure(&app, &state, consecutive_failures, &format!("Ugyldig JSON: {}", e));
+                        // send() returns once the headers arrive; this call is
+                        // what pulls the body down. A timeout mid-download
+                        // therefore surfaces here, and reporting it as
+                        // "Ugyldig JSON" sent us chasing a parsing bug that
+                        // never existed. Name the two apart.
+                        let msg = if e.is_timeout() {
+                            format!(
+                                "Timeout under hentning af print-jobs (forsøg {}) - svaret var for stort eller serveren for langsom",
+                                consecutive_failures
+                            )
+                        } else {
+                            format!("Ugyldigt svar fra server: {}", e)
+                        };
+                        log_polling_failure(&app, &state, consecutive_failures, &msg);
                     }
                 }
             }
@@ -899,21 +916,44 @@ async fn update_job_status(
         "error": error,
     });
 
-    let resp = client
-        .put(&url)
-        .header("X-API-Key", &cfg.api_key)
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    // Losing a "completed" acknowledgement is expensive: the server leaves the
+    // job in "processing", the stale sweep eventually returns it to the queue,
+    // and every label in it comes out of the printer a second time. A single
+    // dropped packet should not cost a reprint, so retry before giving up.
+    const MAX_ATTEMPTS: u32 = 4;
+    let mut last_err = String::new();
 
-    if !resp.status().is_success() {
-        let status_code = resp.status().as_u16();
-        let body_text = resp.text().await.unwrap_or_default();
-        return Err(format!("HTTP {} - {}", status_code, body_text));
+    for attempt in 1..=MAX_ATTEMPTS {
+        match client
+            .put(&url)
+            .header("X-API-Key", &cfg.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => return Ok(()),
+            Ok(resp) => {
+                let status_code = resp.status().as_u16();
+                let body_text = resp.text().await.unwrap_or_default();
+                last_err = format!("HTTP {} - {}", status_code, body_text);
+                // A 4xx means the request itself is wrong (unknown job, bad
+                // key). Repeating it changes nothing.
+                if (400..500).contains(&status_code) {
+                    return Err(last_err);
+                }
+            }
+            Err(e) => {
+                last_err = e.to_string();
+            }
+        }
+
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(1_000 * attempt as u64)).await;
+        }
     }
-    Ok(())
+
+    Err(format!("{} (opgav efter {} forsøg)", last_err, MAX_ATTEMPTS))
 }
 
 // ---------------------------------------------------------------------------
