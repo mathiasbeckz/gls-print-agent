@@ -114,72 +114,6 @@ fn get_printers() -> Result<Vec<String>, String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CUPS queue guard. `lp` reports success the moment a job is QUEUED, not
-// when paper leaves the printer — with ~200 labels submitted blind, a
-// paused queue swallowed half a bulk run without any system noticing
-// (28/9-2026: server delivered 193 labels, all jobs "completed", ~100
-// printed). Capping the queue keeps the success reports honest: a stalled
-// printer stops the run within seconds, visibly, instead of eating it.
-
-const MAX_QUEUED_JOBS: usize = 5;
-const QUEUE_DRAIN_TIMEOUT_SECS: u64 = 90;
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cups_queue_depth(printer_name: &str) -> Result<usize, String> {
-    let output = Command::new("lpstat")
-        .arg("-o")
-        .arg(printer_name)
-        .output()
-        .map_err(|e| format!("lpstat -o: {}", e))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().filter(|l| !l.trim().is_empty()).count())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn cups_printer_paused(printer_name: &str) -> Option<String> {
-    let output = Command::new("lpstat").arg("-p").arg(printer_name).output().ok()?;
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let lower = raw.to_lowercase();
-    if lower.contains("disabled") || lower.contains("paused") || lower.contains("deaktiveret") {
-        Some(raw)
-    } else {
-        None
-    }
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn wait_for_queue_room(printer_name: &str) -> Result<(), String> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(QUEUE_DRAIN_TIMEOUT_SECS);
-    loop {
-        if let Some(state) = cups_printer_paused(printer_name) {
-            return Err(format!(
-                "Printeren er sat på pause ({}). Genoptag printeren, annullér ventende GLS-jobs i printkøen, og print de manglende labels igen fra Pakkeflow.",
-                state
-            ));
-        }
-        match cups_queue_depth(printer_name) {
-            Ok(depth) if depth < MAX_QUEUED_JOBS => return Ok(()),
-            Ok(_) => {}
-            // lpstat unavailable — the guard must never block printing itself.
-            Err(_) => return Ok(()),
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Printkøen tømmes ikke ({} jobs har ventet i {} sek.) — printeren står formentlig stille. Tjek printeren, ryd køen, og print de manglende labels igen fra Pakkeflow.",
-                MAX_QUEUED_JOBS, QUEUE_DRAIN_TIMEOUT_SECS
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn wait_for_queue_room(_printer_name: &str) -> Result<(), String> {
-    Ok(())
-}
-
 // Print result with details
 #[derive(serde::Serialize, Clone)]
 struct PrintResult {
@@ -439,8 +373,6 @@ fn print_pdf_internal(
     // original bytes on any internal failure so a watermark bug can never
     // block printing.
     let pdf_bytes = add_logo_watermark(pdf_bytes);
-
-    wait_for_queue_room(printer_name)?;
 
     let size_kb = pdf_bytes.len() / 1024;
 
@@ -859,15 +791,7 @@ async fn process_job(
     let mut printed_count = 0u32;
     let mut first_print_error: Option<String> = None;
 
-    for (label_index, label) in job.labels.iter().enumerate() {
-        // The queue guard paces printing to the printer's real speed, so a
-        // job can take minutes. The server resets processing jobs that stay
-        // silent past two minutes — and would hand this one out again,
-        // reprinting every label. A processing update refreshes both the
-        // job's processedAt and the agent's liveness.
-        if label_index > 0 && label_index % 5 == 0 {
-            let _ = update_job_status(client, cfg, &job.id, "processing", None).await;
-        }
+    for label in &job.labels {
         let Some(pdf) = &label.label_pdf else {
             emit_log(
                 app,
