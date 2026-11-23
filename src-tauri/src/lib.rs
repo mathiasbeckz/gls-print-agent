@@ -560,6 +560,11 @@ const DRIFT_THRESHOLD_MS: u128 = 10_000;
 // Wire payloads from the server's /api/print-jobs endpoint
 #[derive(Debug, Deserialize)]
 struct ServerLabel {
+    // Shipment-id - sendes tilbage i printedShipmentIds, saa serveren ved
+    // praecis hvilke labels der naaede printeren, ogsaa naar jobbet fejler
+    // halvvejs (ellers taeller de printede labels ikke som printet, og
+    // genprint-varslet tier - dobbeltprint 23/11).
+    id: Option<String>,
     #[serde(rename = "shopifyOrderName")]
     shopify_order_name: String,
     #[serde(rename = "labelPdf")]
@@ -772,7 +777,7 @@ async fn process_job(
     );
 
     // Mark job as processing on the server
-    if let Err(e) = update_job_status(client, cfg, &job.id, "processing", None).await {
+    if let Err(e) = update_job_status(client, cfg, &job.id, "processing", None, None).await {
         emit_log(
             app,
             format!("{} Kunne ikke markere job som processing: {}", mode_label, e),
@@ -784,11 +789,12 @@ async fn process_job(
     if job.labels.is_empty() {
         let msg = "Ingen labels modtaget fra server - tjek at shipments eksisterer i databasen";
         emit_log(app, format!("{} {}", mode_label, msg), "error");
-        let _ = update_job_status(client, cfg, &job.id, "failed", Some(msg)).await;
+        let _ = update_job_status(client, cfg, &job.id, "failed", Some(msg), Some(&[])).await;
         return;
     }
 
     let mut printed_count = 0u32;
+    let mut printed_ids: Vec<String> = Vec::new();
     let mut first_print_error: Option<String> = None;
 
     for label in &job.labels {
@@ -824,6 +830,9 @@ async fn process_job(
                 "success",
             );
             printed_count += 1;
+            if let Some(id) = &label.id {
+                printed_ids.push(id.clone());
+            }
         } else {
             let job_name = format!("GLS Label - {}", label.shopify_order_name);
             let pdf_owned = pdf.clone();
@@ -854,6 +863,9 @@ async fn process_job(
                         "success",
                     );
                     printed_count += 1;
+                    if let Some(id) = &label.id {
+                        printed_ids.push(id.clone());
+                    }
                 }
                 Err(err_msg) => {
                     emit_log(
@@ -869,18 +881,18 @@ async fn process_job(
     }
 
     if let Some(err) = first_print_error {
-        let _ = update_job_status(client, cfg, &job.id, "failed", Some(&err)).await;
+        let _ = update_job_status(client, cfg, &job.id, "failed", Some(&err), Some(&printed_ids)).await;
         return;
     }
 
     if printed_count == 0 {
         let msg = "Ingen labels blev printet - alle manglede PDF data";
         emit_log(app, format!("{} {}", mode_label, msg), "error");
-        let _ = update_job_status(client, cfg, &job.id, "failed", Some(msg)).await;
+        let _ = update_job_status(client, cfg, &job.id, "failed", Some(msg), Some(&printed_ids)).await;
         return;
     }
 
-    if let Err(e) = update_job_status(client, cfg, &job.id, "completed", None).await {
+    if let Err(e) = update_job_status(client, cfg, &job.id, "completed", None, Some(&printed_ids)).await {
         emit_log(
             app,
             format!("{} Kunne ikke markere job som completed: {}", mode_label, e),
@@ -908,13 +920,19 @@ async fn update_job_status(
     job_id: &str,
     status: &str,
     error: Option<&str>,
+    // Hvilke labels der faktisk naaede printeren. Sendes ogsaa (tom) ved
+    // fejl, saa serveren ved at fremdriften ER rapporteret praecist.
+    printed_ids: Option<&[String]>,
 ) -> Result<(), String> {
     let url = format!("{}/api/print-jobs", cfg.api_url);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "jobId": job_id,
         "status": status,
         "error": error,
     });
+    if let Some(ids) = printed_ids {
+        body["printedShipmentIds"] = serde_json::json!(ids);
+    }
 
     // Losing a "completed" acknowledgement is expensive: the server leaves the
     // job in "processing", the stale sweep eventually returns it to the queue,
