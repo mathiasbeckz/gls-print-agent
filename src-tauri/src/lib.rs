@@ -835,20 +835,63 @@ async fn process_job(
             }
         } else {
             let job_name = format!("GLS Label - {}", label.shopify_order_name);
-            let pdf_owned = pdf.clone();
-            let printer_owned = cfg.selected_printer.clone();
-            let darkness_owned = cfg.print_darkness.clone();
             // Run native printing on a blocking thread so we don't block the
             // tokio reactor while `lp` / SumatraPDF runs.
-            let print_outcome: Result<PrintResult, String> =
+            let run_print = |pdf_owned: String, printer_owned: String, job_name_owned: String, darkness_owned: String| async move {
                 match tokio::task::spawn_blocking(move || {
-                    print_pdf_internal(&pdf_owned, &printer_owned, &job_name, &darkness_owned)
+                    print_pdf_internal(&pdf_owned, &printer_owned, &job_name_owned, &darkness_owned)
                 })
                 .await
                 {
                     Ok(inner) => inner,
                     Err(join_err) => Err(format!("Print task panicked: {}", join_err)),
-                };
+                }
+            };
+            let mut print_outcome: Result<PrintResult, String> = run_print(
+                pdf.clone(),
+                cfg.selected_printer.clone(),
+                job_name.clone(),
+                cfg.print_darkness.clone(),
+            )
+            .await;
+
+            // CUPS har et loft for aktive jobs (MaxJobs, set ramt 23/11-2026
+            // ved ~700 labels: "lp: For mange aktive job"). Afvisningen
+            // betyder at labelen ALDRIG kom i koeen, saa det er ikke et
+            // genprint at aflevere den igen - vi venter til koeen draener og
+            // proever samme label igen, i stedet for at fejle hele jobbet.
+            // Maks ~10 min pr. label; undervejs holdes serverens job i live
+            // med et processing-heartbeat, saa sweepen ikke fejler det.
+            let mut queue_full_waits = 0u32;
+            while let Err(err_msg) = &print_outcome {
+                let lowered = err_msg.to_lowercase();
+                let queue_full = lowered.contains("aktive job") || lowered.contains("active jobs");
+                if !queue_full || queue_full_waits >= 120 {
+                    break;
+                }
+                queue_full_waits += 1;
+                if queue_full_waits == 1 {
+                    emit_log(
+                        app,
+                        format!(
+                            "{} Printkøen er fuld - venter på plads og afleverer {} igen (intet er printet dobbelt)",
+                            mode_label, label.shopify_order_name
+                        ),
+                        "info",
+                    );
+                }
+                if queue_full_waits % 12 == 0 {
+                    let _ = update_job_status(client, cfg, &job.id, "processing", None, None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                print_outcome = run_print(
+                    pdf.clone(),
+                    cfg.selected_printer.clone(),
+                    job_name.clone(),
+                    cfg.print_darkness.clone(),
+                )
+                .await;
+            }
 
             match print_outcome {
                 Ok(result) => {
